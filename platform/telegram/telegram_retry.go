@@ -51,6 +51,12 @@ func (b *rateLimitRetryBot) SendMessage(ctx context.Context, params *tgbot.SendM
 	})
 }
 
+func (b *rateLimitRetryBot) SendRichMessage(ctx context.Context, params *tgbot.SendRichMessageParams) (*models.Message, error) {
+	return retryOnRateLimit(ctx, "sendRichMessage", func() (*models.Message, error) {
+		return b.telegramBot.SendRichMessage(ctx, params)
+	})
+}
+
 func (b *rateLimitRetryBot) EditMessageText(ctx context.Context, params *tgbot.EditMessageTextParams) (*models.Message, error) {
 	return retryOnRateLimit(ctx, "editMessageText", func() (*models.Message, error) {
 		return b.telegramBot.EditMessageText(ctx, params)

@@ -3,7 +3,6 @@ package telegram
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -39,6 +39,7 @@ type replyContext struct {
 // *tgbot.Bot satisfies this interface.
 type telegramBot interface {
 	SendMessage(ctx context.Context, params *tgbot.SendMessageParams) (*models.Message, error)
+	SendRichMessage(ctx context.Context, params *tgbot.SendRichMessageParams) (*models.Message, error)
 	SendPhoto(ctx context.Context, params *tgbot.SendPhotoParams) (*models.Message, error)
 	SendDocument(ctx context.Context, params *tgbot.SendDocumentParams) (*models.Message, error)
 	SendVoice(ctx context.Context, params *tgbot.SendVoiceParams) (*models.Message, error)
@@ -112,7 +113,10 @@ type Platform struct {
 	shareSessionInChannel bool
 	enableReactions       bool
 	progressStyle         string // "legacy" | "compact" — telegram has no rich card, so "card" is mapped to "compact"
+	richMessages          bool   // send replies and previews via Bot API 10.x sendRichMessage
 	httpClient            *http.Client
+
+	richUnsupported atomic.Bool // set once the Bot API server rejects rich methods as unknown
 
 	mu                  sync.RWMutex
 	bot                 telegramBot
@@ -183,6 +187,13 @@ func New(opts map[string]any) (core.Platform, error) {
 		}
 	}
 
+	// Native rich messages (Bot API 10.1+) render tables, headings and lists.
+	// On by default; rich_messages = false restores the HTML-only path.
+	richMessages := true
+	if v, ok := opts["rich_messages"].(bool); ok {
+		richMessages = v
+	}
+
 	return &Platform{
 		token:                 token,
 		allowFrom:             allowFrom,
@@ -190,6 +201,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		shareSessionInChannel: shareSessionInChannel,
 		enableReactions:       enableReactions,
 		progressStyle:         progressStyle,
+		richMessages:          richMessages,
 		httpClient:            httpClient,
 	}, nil
 }
@@ -1036,155 +1048,73 @@ func isCommand(msg *models.Message) bool {
 	return false
 }
 
-type inputRichMessage struct {
-	Markdown            string `json:"markdown,omitempty"`
-	HTML                string `json:"html,omitempty"`
-	IsRTL               bool   `json:"is_rtl,omitempty"`
-	SkipEntityDetection bool   `json:"skip_entity_detection,omitempty"`
+// richMessageFor builds the Bot API 10.x rich message payload for agent
+// Markdown. Rich Markdown is GFM-compatible, so tables, headings, lists and
+// code fences render natively instead of being flattened into <pre> blocks.
+func richMessageFor(content string) models.InputRichMessage {
+	md := core.StripANSI(content)
+	return models.InputRichMessage{Markdown: md, IsRTL: core.IsRTL(md)}
 }
 
-type sendRichMessageParams struct {
-	ChatID          any                          `json:"chat_id"`
-	MessageThreadID int                          `json:"message_thread_id,omitempty"`
-	RichMessage     inputRichMessage             `json:"rich_message"`
-	ReplyParameters *models.ReplyParameters      `json:"reply_parameters,omitempty"`
-	ReplyMarkup     *models.InlineKeyboardMarkup `json:"reply_markup,omitempty"`
+// useRich reports whether sends should try sendRichMessage first.
+func (p *Platform) useRich() bool {
+	return p.richMessages && !p.richUnsupported.Load()
 }
 
-type editRichMessageParams struct {
-	ChatID      any                          `json:"chat_id"`
-	MessageID   int                          `json:"message_id"`
-	RichMessage inputRichMessage             `json:"rich_message"`
-	ReplyMarkup *models.InlineKeyboardMarkup `json:"reply_markup,omitempty"`
-}
-
-func (p *Platform) sendRichMessage(ctx context.Context, chatID any, threadID int, replyMsgID int, content string, markup *models.InlineKeyboardMarkup) (*models.Message, error) {
-	cleanMd := core.StripANSI(content)
-	cleanMd = core.FormatSmartTelegramRichMarkdown(cleanMd)
-	isRTL := core.IsRTL(cleanMd)
-
-	var replyParams *models.ReplyParameters
-	if replyMsgID != 0 {
-		replyParams = &models.ReplyParameters{MessageID: replyMsgID}
-	}
-
-	payload := sendRichMessageParams{
-		ChatID:          chatID,
-		MessageThreadID: threadID,
-		RichMessage: inputRichMessage{
-			Markdown: cleanMd,
-			IsRTL:    isRTL,
-		},
-		ReplyParameters: replyParams,
-		ReplyMarkup:     markup,
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-
-	apiURL := "https://api.telegram.org/bot" + p.token + "/sendRichMessage"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := p.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var tgResp struct {
-		OK          bool            `json:"ok"`
-		Result      *models.Message `json:"result"`
-		Description string          `json:"description"`
-		ErrorCode   int             `json:"error_code"`
-	}
-	if err := json.Unmarshal(bodyBytes, &tgResp); err != nil {
-		return nil, fmt.Errorf("decode sendRichMessage response: %w", err)
-	}
-
-	if !tgResp.OK {
-		return nil, fmt.Errorf("sendRichMessage (code %d): %s", tgResp.ErrorCode, tgResp.Description)
-	}
-
-	return tgResp.Result, nil
-}
-
-func (p *Platform) editRichMessage(ctx context.Context, chatID any, messageID int, content string, markup *models.InlineKeyboardMarkup) (*models.Message, error) {
-	cleanMd := core.StripANSI(content)
-	cleanMd = core.FormatSmartTelegramRichMarkdown(cleanMd)
-	isRTL := core.IsRTL(cleanMd)
-
-	payload := editRichMessageParams{
-		ChatID:    chatID,
-		MessageID: messageID,
-		RichMessage: inputRichMessage{
-			Markdown: cleanMd,
-			IsRTL:    isRTL,
-		},
-		ReplyMarkup: markup,
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-
-	apiURL := "https://api.telegram.org/bot" + p.token + "/editMessageText"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := p.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var tgResp struct {
-		OK          bool            `json:"ok"`
-		Result      *models.Message `json:"result"`
-		Description string          `json:"description"`
-		ErrorCode   int             `json:"error_code"`
-	}
-	if err := json.Unmarshal(bodyBytes, &tgResp); err != nil {
-		return nil, fmt.Errorf("decode editMessageText response: %w", err)
-	}
-
-	if !tgResp.OK {
-		if strings.Contains(tgResp.Description, "not modified") {
-			return nil, nil
+// richFallbackOK reports whether a failed rich send/edit may be retried on the
+// legacy HTML path. Only definitive API rejections qualify: after a network
+// error or timeout the rich message may already have been delivered, and
+// re-sending it as HTML would duplicate it in the chat.
+func (p *Platform) richFallbackOK(method string, err error) bool {
+	switch {
+	case errors.Is(err, tgbot.ErrorNotFound):
+		// The Bot API server (e.g. an outdated self-hosted one) does not
+		// know the method; stop trying for the lifetime of the process.
+		if p.richUnsupported.CompareAndSwap(false, true) {
+			slog.Warn("telegram: rich messages unsupported by Bot API server, using HTML", "method", method, "error", err)
 		}
-		return nil, fmt.Errorf("editMessageText (code %d): %s", tgResp.ErrorCode, tgResp.Description)
+		return true
+	case errors.Is(err, tgbot.ErrorBadRequest):
+		slog.Warn("telegram: rich message rejected, falling back to HTML", "method", method, "error", err)
+		return true
 	}
+	return false
+}
 
-	return tgResp.Result, nil
+// sendRich sends content as a native rich message. replyToID of 0 sends a
+// plain (non-reply) message.
+func (p *Platform) sendRich(ctx context.Context, rc replyContext, replyToID int, content string) (*models.Message, error) {
+	bot, err := p.connectedBot("send rich")
+	if err != nil {
+		return nil, err
+	}
+	params := &tgbot.SendRichMessageParams{
+		ChatID:          rc.chatID,
+		MessageThreadID: rc.threadID,
+		RichMessage:     richMessageFor(content),
+	}
+	if replyToID != 0 {
+		params.ReplyParameters = &models.ReplyParameters{MessageID: replyToID}
+	}
+	return bot.SendRichMessage(ctx, params)
+}
+
+// editRich replaces the content of an existing message with a rich message.
+func (p *Platform) editRich(ctx context.Context, h *telegramPreviewHandle, content string) error {
+	bot, err := p.connectedBot("edit rich")
+	if err != nil {
+		return err
+	}
+	rich := richMessageFor(content)
+	_, err = bot.EditMessageText(ctx, &tgbot.EditMessageTextParams{
+		ChatID:      h.chatID,
+		MessageID:   h.messageID,
+		RichMessage: &rich,
+	})
+	if err != nil && strings.Contains(err.Error(), "not modified") {
+		return nil
+	}
+	return err
 }
 
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
@@ -1193,11 +1123,14 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("telegram: invalid reply context type %T", rctx)
 	}
 
-	// Try native Telegram Bot API 10.x sendRichMessage first
-	if _, err := p.sendRichMessage(ctx, rc.chatID, rc.threadID, rc.messageID, content, nil); err == nil {
-		return nil
-	} else {
-		slog.Debug("telegram: sendRichMessage fallback", "error", err)
+	if p.useRich() {
+		_, err := p.sendRich(ctx, rc, rc.messageID, content)
+		if err == nil {
+			return nil
+		}
+		if !p.richFallbackOK("Reply", err) {
+			return fmt.Errorf("telegram: send rich: %w", err)
+		}
 	}
 
 	bot, err := p.connectedBot("reply")
@@ -1205,7 +1138,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 		return err
 	}
 
-	html := core.FormatSmartTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	params := &tgbot.SendMessageParams{
 		ChatID:          rc.chatID,
 		MessageThreadID: rc.threadID,
@@ -1249,11 +1182,14 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("telegram: invalid reply context type %T", rctx)
 	}
 
-	// Try native Telegram Bot API 10.x sendRichMessage first
-	if _, err := p.sendRichMessage(ctx, rc.chatID, rc.threadID, 0, content, nil); err == nil {
-		return nil
-	} else {
-		slog.Debug("telegram: sendRichMessage fallback", "error", err)
+	if p.useRich() {
+		_, err := p.sendRich(ctx, rc, 0, content)
+		if err == nil {
+			return nil
+		}
+		if !p.richFallbackOK("Send", err) {
+			return fmt.Errorf("telegram: send rich: %w", err)
+		}
 	}
 
 	bot, err := p.connectedBot("send")
@@ -1261,7 +1197,7 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 		return err
 	}
 
-	html := core.FormatSmartTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	params := &tgbot.SendMessageParams{
 		ChatID:          rc.chatID,
 		MessageThreadID: rc.threadID,
@@ -1451,21 +1387,16 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 		}
 		rows = append(rows, btns)
 	}
+	// Button messages stay on the HTML path: the callback handlers rebuild
+	// the edited message from msg.Text, which rich messages leave empty.
 	markup := &models.InlineKeyboardMarkup{InlineKeyboard: rows}
-
-	// Try native Telegram Bot API 10.x sendRichMessage first
-	if _, err := p.sendRichMessage(ctx, rc.chatID, rc.threadID, 0, content, markup); err == nil {
-		return nil
-	} else {
-		slog.Debug("telegram: sendRichMessage with buttons fallback", "error", err)
-	}
 
 	bot, err := p.connectedBot("send with buttons")
 	if err != nil {
 		return err
 	}
 
-	html := core.FormatSmartTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	params := &tgbot.SendMessageParams{
 		ChatID:          rc.chatID,
 		MessageThreadID: rc.threadID,
@@ -1589,6 +1520,7 @@ type telegramPreviewHandle struct {
 	chatID    int64
 	threadID  int
 	messageID int
+	rich      bool // sent via sendRichMessage, so edits must use rich_message too
 }
 
 // SendPreviewStart sends a new message and returns a handle for subsequent edits.
@@ -1598,11 +1530,14 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		return nil, fmt.Errorf("telegram: invalid reply context type %T", rctx)
 	}
 
-	// Try native Telegram Bot API 10.x sendRichMessage first
-	if msg, err := p.sendRichMessage(ctx, rc.chatID, rc.threadID, 0, content, nil); err == nil && msg != nil {
-		return &telegramPreviewHandle{chatID: rc.chatID, threadID: rc.threadID, messageID: msg.ID}, nil
-	} else {
-		slog.Debug("telegram: sendRichMessage preview start fallback", "error", err)
+	if p.useRich() {
+		sent, err := p.sendRich(ctx, rc, 0, content)
+		if err == nil {
+			return &telegramPreviewHandle{chatID: rc.chatID, threadID: rc.threadID, messageID: sent.ID, rich: true}, nil
+		}
+		if !p.richFallbackOK("SendPreviewStart", err) {
+			return nil, fmt.Errorf("telegram: send preview rich: %w", err)
+		}
 	}
 
 	bot, err := p.connectedBot("send preview")
@@ -1610,7 +1545,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		return nil, err
 	}
 
-	html := core.FormatSmartTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	params := &tgbot.SendMessageParams{
 		ChatID:          rc.chatID,
 		MessageThreadID: rc.threadID,
@@ -1657,11 +1592,14 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 		return fmt.Errorf("telegram: invalid preview handle type %T", previewHandle)
 	}
 
-	// Try native Telegram Bot API 10.x editRichMessage first
-	if _, err := p.editRichMessage(ctx, h.chatID, h.messageID, content, nil); err == nil {
-		return nil
-	} else {
-		slog.Debug("telegram: editRichMessage fallback", "error", err)
+	if h.rich && p.useRich() {
+		err := p.editRich(ctx, h, content)
+		if err == nil {
+			return nil
+		}
+		if !p.richFallbackOK("UpdateMessage", err) {
+			return fmt.Errorf("telegram: edit message rich: %w", err)
+		}
 	}
 
 	bot, err := p.connectedBot("update message")
@@ -1669,7 +1607,7 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 		return err
 	}
 
-	html := core.FormatSmartTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	slog.Debug("telegram: UpdateMessage",
 		"content_len", len(content), "html_len", len(html),
 		"content_prefix", truncateForLog(content, 80),

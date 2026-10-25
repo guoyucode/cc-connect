@@ -104,6 +104,16 @@ func (b *stubTelegramBot) SendMessage(_ context.Context, _ *tgbot.SendMessagePar
 	return &models.Message{ID: 99}, nil
 }
 
+func (b *stubTelegramBot) SendRichMessage(_ context.Context, _ *tgbot.SendRichMessageParams) (*models.Message, error) {
+	b.mu.Lock()
+	b.sendMessageCalls++
+	b.mu.Unlock()
+	if b.sendErr != nil {
+		return nil, b.sendErr
+	}
+	return &models.Message{ID: 99}, nil
+}
+
 func (b *stubTelegramBot) SendPhoto(_ context.Context, _ *tgbot.SendPhotoParams) (*models.Message, error) {
 	b.mu.Lock()
 	b.sendPhotoCalls++
