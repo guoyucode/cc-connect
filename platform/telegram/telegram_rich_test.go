@@ -207,3 +207,14 @@ func TestNewRichMessagesOption(t *testing.T) {
 		}
 	}
 }
+
+func TestToolBlockProgressFollowsRich(t *testing.T) {
+	p, _ := newRichTestPlatform(t, nil)
+	if !p.ToolBlockProgress() {
+		t.Fatal("ToolBlockProgress = false with rich messages on")
+	}
+	p.richMessages = false
+	if p.ToolBlockProgress() {
+		t.Fatal("ToolBlockProgress = true on the HTML path")
+	}
+}

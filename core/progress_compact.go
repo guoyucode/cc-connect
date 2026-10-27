@@ -230,6 +230,7 @@ type compactProgressWriter struct {
 	truncated  bool
 	lastSent   string
 	maxEntries int
+	toolBlocks *toolBlockProgress // non-nil when the platform merges each tool call into one block
 
 	// Throttle message edits to avoid platform rate limits (e.g. Discord ~5 edits/5s).
 	minUpdateInterval time.Duration
@@ -324,6 +325,9 @@ func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, age
 	w.updater = updater
 	if starter, ok := p.(PreviewStarter); ok {
 		w.starter = starter
+	}
+	if w.style == progressStyleCompact && toolBlockProgressEnabled(p) {
+		w.toolBlocks = newToolBlockProgress(lang)
 	}
 	if w.style == progressStyleCard {
 		if progressCardPayloadForTarget(p, replyCtx) {
@@ -440,7 +444,9 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 			w.content = trimCompactProgressText(w.content, compactProgressMaxChars)
 		}
 	default:
-		if w.content == "" {
+		if w.toolBlocks != nil {
+			w.content = w.toolBlocks.append(item, fallback)
+		} else if w.content == "" {
 			w.content = fallback
 		} else {
 			w.content += "\n\n" + fallback

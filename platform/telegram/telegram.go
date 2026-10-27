@@ -1056,6 +1056,13 @@ func richMessageFor(content string) models.InputRichMessage {
 	return models.InputRichMessage{Markdown: md, IsRTL: core.IsRTL(md)}
 }
 
+// ToolBlockProgress merges each tool call's input, status and output into one
+// code block in the compact progress message. Rich messages show the fence
+// info string (#N·Tool) as the code block header.
+func (p *Platform) ToolBlockProgress() bool {
+	return p.useRich()
+}
+
 // useRich reports whether sends should try sendRichMessage first.
 func (p *Platform) useRich() bool {
 	return p.richMessages && !p.richUnsupported.Load()
