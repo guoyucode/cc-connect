@@ -5798,7 +5798,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if e.display.ToolMessages {
 				// --- StreamingCard path ---
 				if streamCard != nil && !streamCard.Failed() {
-					toolInput := event.ToolInput
+					toolInput := truncateIf(event.ToolInput, e.display.ToolMaxLen)
 					var formattedInput string
 					if toolInput == "" {
 						formattedInput = ""
@@ -5842,7 +5842,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if previewActive {
 					sp.detachPreview() // keep frozen preview visible as permanent message
 				}
-				toolInput := event.ToolInput
+				toolInput := truncateIf(event.ToolInput, e.display.ToolMaxLen)
 				var formattedInput string
 				if toolInput == "" {
 					formattedInput = ""

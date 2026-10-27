@@ -1985,6 +1985,51 @@ func TestProcessInteractiveEvents_CardProgressTruncatesToolInputByToolMaxLen(t *
 	}
 }
 
+// TestProcessInteractiveEvents_ToolMessageTruncatesToolInputByToolMaxLen
+// verifies that the per-tool progress message (legacy/compact styles, e.g.
+// Telegram) honors display.ToolMaxLen, not just the card payload.
+func TestProcessInteractiveEvents_ToolMessageTruncatesToolInputByToolMaxLen(t *testing.T) {
+	p := &stubPlatformEngine{n: "telegram"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{ThinkingMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 50, ToolMessages: true})
+
+	sessionKey := "telegram:user-tool-truncate"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-tool-truncate")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-tool-truncate",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	longInput := strings.Repeat("abcdefghij", 12) // 120 chars
+	toolEvt := Event{Type: EventToolUse, ToolName: "Bash", ToolInput: longInput}
+	agentSession.events <- toolEvt
+	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-tool-truncate", time.Now(), nil, nil, state.replyCtx, 0)
+
+	if toolEvt.ToolInput != longInput {
+		t.Fatalf("event.ToolInput was mutated")
+	}
+	var toolMsg string
+	for _, m := range p.getSent() {
+		if strings.Contains(m, "Tool #1") {
+			toolMsg = m
+		}
+	}
+	if toolMsg == "" {
+		t.Fatalf("no tool message sent; sent=%#v", p.getSent())
+	}
+	if strings.Contains(toolMsg, longInput) {
+		t.Fatalf("tool message not truncated: %q", toolMsg)
+	}
+	if !strings.Contains(toolMsg, longInput[:50]+"...") {
+		t.Fatalf("tool message missing truncated input: %q", toolMsg)
+	}
+}
+
 func TestProcessInteractiveEvents_RichCardShowsThinkingContent(t *testing.T) {
 	p := &stubCompactProgressPlatform{
 		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
