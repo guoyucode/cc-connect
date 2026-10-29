@@ -176,3 +176,68 @@ func TestProcessInteractiveEvents_ToolBlockProgressSplitsAfterText(t *testing.T)
 		t.Fatalf("second progress message should hold only #2:\n%s", progressStarts[1])
 	}
 }
+
+func TestUnsolicitedReader_ShowsToolBlocksAndFooter(t *testing.T) {
+	p := &stubToolBlockPlatform{stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}, style: "compact"}}
+	agent := &stubReplyFooterAgent{stubModelModeAgent: stubModelModeAgent{model: "glm-5.1"}, workDir: t.TempDir()}
+	sess := newControllableSession("unsol-tool-block")
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	defer func() { _ = e.Stop() }()
+	e.SetReplyFooterEnabled(true)
+	e.SetDisplayConfig(DisplayCfg{ThinkingMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 300, ToolMessages: true, Mode: "full"})
+
+	iKey := "telegram:u1:u1"
+	session := e.sessions.GetOrCreateActive(iKey)
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx", agent: agent}
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = state
+	e.interactiveMu.Unlock()
+
+	e.startUnsolicitedReader(state, session, e.sessions, iKey, "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "go build ./..."}
+	sess.events <- Event{Type: EventToolResult, ToolResult: "ok", ToolSuccess: boolPtr(true), ToolExitCode: intPtr(0)}
+	sess.events <- Event{Type: EventText, Content: "Build fixed."}
+	sess.events <- Event{Type: EventResult, Done: true}
+
+	sent := waitForPlatformSend(&p.stubPlatformEngine, 1, 5*time.Second)
+	if len(sent) != 1 || !strings.HasPrefix(sent[0], "Build fixed.") || !strings.Contains(sent[0], "glm-5.1") {
+		t.Fatalf("sent = %#v, want the reply with a footer", sent)
+	}
+	starts := p.getPreviewStarts()
+	if len(starts) != 1 || !strings.HasPrefix(starts[0], "```#1·Bash\n$ go build ./...") {
+		t.Fatalf("progress starts = %#v, want one tool-block progress message", starts)
+	}
+	edits := p.getPreviewEdits()
+	if len(edits) == 0 || !strings.Contains(edits[len(edits)-1], "──────── 🟢 ok · Exit 0 ────────\nok\n```") {
+		t.Fatalf("progress edits = %#v, want the result merged into #1", edits)
+	}
+}
+
+func TestUnsolicitedReader_NoToolProgressWithoutToolBlocks(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-no-tool-block")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer func() { _ = e.Stop() }()
+
+	iKey := "test:ch1:u1"
+	session := e.sessions.GetOrCreateActive(iKey)
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = state
+	e.interactiveMu.Unlock()
+
+	e.startUnsolicitedReader(state, session, e.sessions, iKey, "")
+	defer e.stopUnsolicitedReader(state)
+
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "ls"}
+	sess.events <- Event{Type: EventToolResult, ToolResult: "a.go", ToolSuccess: boolPtr(true)}
+	sess.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	sent := waitForPlatformSend(p, 1, 5*time.Second)
+	time.Sleep(50 * time.Millisecond)
+	if sent = p.getSent(); len(sent) != 1 || sent[0] != "done" {
+		t.Fatalf("sent = %#v, want only the final text", sent)
+	}
+}

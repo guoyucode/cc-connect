@@ -5091,6 +5091,10 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 
 	var textParts []string
 	var toolsUsed []string
+	// Tool progress for unsolicited turns, shown like foreground turns on
+	// platforms with tool-block progress; created on the first tool call.
+	var cp *compactProgressWriter
+	toolCount := 0
 
 	// flushPartial relays text already accumulated for an unsolicited turn
 	// that will not reach its EventResult through this reader (a new
@@ -5204,20 +5208,35 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 
 			case EventToolUse:
 				// Record tool name so we can log or surface context if the
-				// channel closes before a clean EventResult. Output is
-				// delivered via EventResult; we intentionally do not relay
-				// per-tool progress here (no active user turn to observe it).
+				// channel closes before a clean EventResult. Text is delivered
+				// via EventResult. Per-tool progress is relayed only on
+				// platforms with tool-block progress, where it goes to one
+				// in-place progress message rather than a message per tool.
 				if event.ToolName != "" {
 					toolsUsed = append(toolsUsed, event.ToolName)
 				}
 				slog.Debug("unsolicited tool use",
 					"session", sessionKey,
 					"tool", event.ToolName)
+				if e.display.ToolMessages && toolBlockProgressEnabled(p) {
+					if cp == nil {
+						cp = newCompactProgressWriter(e.ctx, p, replyCtx, e.agent.Name(), e.i18n.CurrentLang(), nil)
+					}
+					toolCount++
+					input, msg := e.toolUseProgress(toolCount, event)
+					cp.AppendEvent(ProgressEntryToolUse, input, event.ToolName, msg)
+				}
 
 			case EventToolResult:
 				slog.Debug("unsolicited tool result",
 					"session", sessionKey,
 					"status", event.ToolStatus)
+				if cp != nil {
+					if result := e.toolResultText(event); hasToolResultInfo(event, result) {
+						entry, msg := e.toolResultProgress(event, result)
+						cp.AppendStructured(entry, msg)
+					}
+				}
 
 			case EventModelSwitch:
 				e.relayModelSwitch(p, replyCtx, sessionKey, event.ModelSwitch)
@@ -5229,9 +5248,18 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				}
 
 				if fullResponse != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
-						e.send(p, replyCtx, chunk)
+					state.mu.Lock()
+					replyAgent := state.agent
+					state.mu.Unlock()
+					if replyAgent == nil {
+						replyAgent = e.agent
 					}
+					footerContext := replyFooterContextText(replyFooterSessionContextUsage(agentSession), e.i18n)
+					statusFooter, _ := e.turnStatusFooter(replyAgent, agentSession, workspaceDir, footerContext)
+					sendChunksWithStatusFooter(e.ctx, p, replyCtx, fullResponse, statusFooter, func(p Platform, replyCtx any, chunk string) error {
+						e.send(p, replyCtx, chunk)
+						return nil
+					})
 				}
 
 				// Safety note: concurrent writes to session.History by the
@@ -5256,6 +5284,8 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// Reset for potential subsequent unsolicited turn.
 				textParts = nil
 				toolsUsed = nil
+				cp = nil
+				toolCount = 0
 				turnActive = false
 				if workspaceDir != "" && e.workspacePool != nil {
 					if ws := e.workspacePool.Get(workspaceDir); ws != nil {
@@ -5798,23 +5828,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if e.display.ToolMessages {
 				// --- StreamingCard path ---
 				if streamCard != nil && !streamCard.Failed() {
-					toolInput := truncateIf(event.ToolInput, e.display.ToolMaxLen)
-					var formattedInput string
-					if toolInput == "" {
-						formattedInput = ""
-					} else if strings.Contains(toolInput, "```") {
-						formattedInput = toolInput
-					} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
-						lang := toolCodeLang(event.ToolName, toolInput)
-						formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
-					} else {
-						switch event.ToolName {
-						case "shell", "run_shell_command", "Bash":
-							formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
-						default:
-							formattedInput = fmt.Sprintf("`%s`", toolInput)
-						}
-					}
+					formattedInput := formatToolInput(event.ToolName, truncateIf(event.ToolInput, e.display.ToolMaxLen))
 					cardToolCalls = append(cardToolCalls, cardToolEntry{
 						Index: toolCount,
 						Name:  event.ToolName,
@@ -5842,28 +5856,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if previewActive {
 					sp.detachPreview() // keep frozen preview visible as permanent message
 				}
-				toolInput := truncateIf(event.ToolInput, e.display.ToolMaxLen)
-				var formattedInput string
-				if toolInput == "" {
-					formattedInput = ""
-				} else if strings.Contains(toolInput, "```") {
-					formattedInput = toolInput
-				} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
-					lang := toolCodeLang(event.ToolName, toolInput)
-					formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
-				} else {
-					switch event.ToolName {
-					case "shell", "run_shell_command", "Bash":
-						formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
-					default:
-						formattedInput = fmt.Sprintf("`%s`", toolInput)
-					}
-				}
-				toolMsg := fmt.Sprintf(e.i18n.T(MsgTool), toolCount, event.ToolName, formattedInput)
-				// Truncate the tool input that goes into the progress card payload so
-				// tool_max_len applies uniformly to progress_style=card, matching
-				// the rich-card path. event.ToolInput itself is left untouched.
-				cardToolInput := truncateIf(toolInput, e.display.ToolMaxLen)
+				// tool_max_len applies uniformly to the progress card payload and
+				// the per-tool message. event.ToolInput itself is left untouched.
+				cardToolInput, toolMsg := e.toolUseProgress(toolCount, event)
 				if !cp.AppendEvent(ProgressEntryToolUse, cardToolInput, event.ToolName, toolMsg) {
 					for _, chunk := range SplitMessageCodeFenceAware(toolMsg, maxPlatformMessageLen) {
 						sendWorkspace(p, replyCtx, chunk)
@@ -5873,14 +5868,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventToolResult:
 			if e.display.ToolMessages {
-				result := strings.TrimSpace(event.ToolResult)
-				if result == "" {
-					result = strings.TrimSpace(event.Content)
-				}
-				if result != "" {
-					result = truncateIf(result, e.display.ToolMaxLen)
-				}
-				if result != "" || event.ToolStatus != "" || event.ToolExitCode != nil || event.ToolSuccess != nil {
+				result := e.toolResultText(event)
+				if hasToolResultInfo(event, result) {
 					if hasRichCard {
 						toolSteps = mergeRichToolResult(toolSteps, event, result, e.display.ToolMaxLen)
 						if cardMessageID == nil {
@@ -5901,15 +5890,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 						break
 					}
-					resultMsg := e.formatToolResultEventFallback(event.ToolName, result, event.ToolStatus, event.ToolExitCode, event.ToolSuccess)
-					entry := ProgressCardEntry{
-						Kind:     ProgressEntryToolResult,
-						Tool:     event.ToolName,
-						Text:     result,
-						Status:   event.ToolStatus,
-						ExitCode: event.ToolExitCode,
-						Success:  event.ToolSuccess,
-					}
+					entry, resultMsg := e.toolResultProgress(event, result)
 					if !cp.AppendStructured(entry, resultMsg) {
 						if !SuppressStandaloneToolResultEvent(p) {
 							e.sendRaw(p, replyCtx, resultMsg)
@@ -6358,12 +6339,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						footerContext = fmt.Sprintf("[ctx: ~%d%%]", selfPct)
 					}
 				}
-				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir); status != "" {
-					statusFooter = status
-				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext); footer != "" {
-					statusFooter = footer
-					legacyStatusFooter = footer
-				}
+				statusFooter, legacyStatusFooter = e.turnStatusFooter(replyAgent, state.agentSession, workspaceDir, footerContext)
 			}
 			fullResponse = cleanResponse
 
@@ -16418,6 +16394,72 @@ func toolCodeLang(toolName, input string) string {
 		return "diff"
 	}
 	return ""
+}
+
+// formatToolInput renders a tool input for a per-tool progress message:
+// multi-line or long input as a fenced code block, short shell commands as a
+// bash block and anything else as inline code.
+func formatToolInput(toolName, toolInput string) string {
+	switch {
+	case toolInput == "":
+		return ""
+	case strings.Contains(toolInput, "```"):
+		return toolInput
+	case strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200:
+		return fmt.Sprintf("```%s\n%s\n```", toolCodeLang(toolName, toolInput), toolInput)
+	}
+	switch toolName {
+	case "shell", "run_shell_command", "Bash":
+		return fmt.Sprintf("```bash\n%s\n```", toolInput)
+	}
+	return fmt.Sprintf("`%s`", toolInput)
+}
+
+// toolUseProgress returns the tool_max_len-truncated input of a tool use
+// event (the progress entry text) and the per-tool message shown for it.
+func (e *Engine) toolUseProgress(n int, event Event) (input, msg string) {
+	input = truncateIf(event.ToolInput, e.display.ToolMaxLen)
+	return input, fmt.Sprintf(e.i18n.T(MsgTool), n, event.ToolName, formatToolInput(event.ToolName, input))
+}
+
+// toolResultText returns the trimmed, tool_max_len-truncated output of a
+// tool result event.
+func (e *Engine) toolResultText(event Event) string {
+	result := strings.TrimSpace(event.ToolResult)
+	if result == "" {
+		result = strings.TrimSpace(event.Content)
+	}
+	return truncateIf(result, e.display.ToolMaxLen)
+}
+
+// hasToolResultInfo reports whether a tool result has anything to show.
+func hasToolResultInfo(event Event, result string) bool {
+	return result != "" || event.ToolStatus != "" || event.ToolExitCode != nil || event.ToolSuccess != nil
+}
+
+// toolResultProgress builds the progress entry for a tool result and the
+// plain-text message used when structured progress is unavailable.
+func (e *Engine) toolResultProgress(event Event, result string) (ProgressCardEntry, string) {
+	entry := ProgressCardEntry{
+		Kind:     ProgressEntryToolResult,
+		Tool:     event.ToolName,
+		Text:     result,
+		Status:   event.ToolStatus,
+		ExitCode: event.ToolExitCode,
+		Success:  event.ToolSuccess,
+	}
+	return entry, e.formatToolResultEventFallback(event.ToolName, result, event.ToolStatus, event.ToolExitCode, event.ToolSuccess)
+}
+
+// turnStatusFooter returns the footer for a finished turn: the Claude status
+// line when available, otherwise the reply footer, which is also returned as
+// legacy for paths that inline it.
+func (e *Engine) turnStatusFooter(agent Agent, session AgentSession, workspaceDir, footerContext string) (status, legacy string) {
+	if status := e.buildClaudeStatusLineFooter(agent, session, workspaceDir); status != "" {
+		return status, ""
+	}
+	footer := e.buildReplyFooter(agent, session, workspaceDir, footerContext)
+	return footer, footer
 }
 
 func (e *Engine) formatToolResultEventFallback(toolName, result, status string, exitCode *int, success *bool) string {
