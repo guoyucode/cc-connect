@@ -5924,6 +5924,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				content = stripAgentFooterLines(content)
 			}
 			if content != "" && !isEllipsisOnly(content) {
+				cp.MarkSegment()
 				// Pre-compute silentHold transition including this chunk so the
 				// rich-card path doesn't leak a preview that gets recalled at
 				// end-of-stream when the text resolves to bare NO_REPLY (Lark

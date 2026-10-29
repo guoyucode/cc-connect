@@ -3,6 +3,7 @@ package core
 import (
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ToolBlockProgressSupport is an optional interface for platforms whose
@@ -20,11 +21,20 @@ func toolBlockProgressEnabled(p Platform) bool {
 
 // toolBlockProgress keeps compact progress entries as separate blocks so a
 // tool's block can be replaced when its result arrives.
+//
+// Progress is split into segments: once agent text has been shown after the
+// current progress message, the next entry starts a new progress message
+// below that text, so the message being updated stays at the bottom of the
+// chat. Tool numbering continues across segments.
 type toolBlockProgress struct {
-	i18n    *I18n
-	blocks  []string
-	pending []pendingToolBlock // tool calls awaiting results, oldest first
-	seq     int
+	i18n     *I18n
+	lang     Language
+	maxRunes int
+	blocks   []string
+	pending  []pendingToolBlock // tool calls awaiting results, oldest first
+	seq      int
+	omitted  int  // leading blocks dropped from this segment to fit maxRunes
+	split    bool // text was shown since the last entry; start a new segment
 }
 
 type pendingToolBlock struct {
@@ -33,8 +43,27 @@ type pendingToolBlock struct {
 	use   ProgressCardEntry
 }
 
-func newToolBlockProgress(lang Language) *toolBlockProgress {
-	return &toolBlockProgress{i18n: NewI18n(lang)}
+func newToolBlockProgress(lang Language, maxRunes int) *toolBlockProgress {
+	return &toolBlockProgress{i18n: NewI18n(lang), lang: lang, maxRunes: maxRunes}
+}
+
+// MarkSegment records that agent text was shown, so later progress goes to a
+// new message below it. It is a no-op unless tool-block progress is enabled.
+func (w *compactProgressWriter) MarkSegment() {
+	if w.toolBlocks != nil && len(w.toolBlocks.blocks) > 0 {
+		w.toolBlocks.split = true
+	}
+}
+
+// startSegment clears the blocks of the previous progress message when a new
+// segment is due, and reports whether the caller must send a new message.
+func (t *toolBlockProgress) startSegment() bool {
+	if !t.split {
+		return false
+	}
+	t.split = false
+	t.blocks, t.pending, t.omitted = nil, nil, 0
+	return true
 }
 
 // append records one progress entry and returns the full progress markdown.
@@ -60,7 +89,39 @@ func (t *toolBlockProgress) append(item ProgressCardEntry, fallback string) stri
 	default:
 		t.blocks = append(t.blocks, fallback)
 	}
-	return strings.Join(t.blocks, "\n\n")
+	return t.content()
+}
+
+// content joins the blocks, dropping whole blocks from the front when the
+// message would exceed maxRunes. Cutting inside a block would leave an
+// unbalanced code fence and garble everything after it.
+func (t *toolBlockProgress) content() string {
+	for {
+		out := strings.Join(t.blocks, "\n\n")
+		if t.omitted > 0 {
+			out = t.omittedNote() + "\n\n" + out
+		}
+		if t.maxRunes <= 0 || len(t.blocks) <= 1 || utf8.RuneCountInString(out) <= t.maxRunes {
+			return out
+		}
+		t.blocks = t.blocks[1:]
+		t.omitted++
+		kept := t.pending[:0]
+		for _, pt := range t.pending {
+			if pt.block--; pt.block >= 0 {
+				kept = append(kept, pt)
+			}
+		}
+		t.pending = kept
+	}
+}
+
+func (t *toolBlockProgress) omittedNote() string {
+	switch t.lang {
+	case LangChinese, LangTraditionalChinese:
+		return "…（前面 " + strconv.Itoa(t.omitted) + " 条已省略）"
+	}
+	return "… (" + strconv.Itoa(t.omitted) + " earlier entries omitted)"
 }
 
 func (t *toolBlockProgress) render(seq int, use ProgressCardEntry, result *ProgressCardEntry) string {

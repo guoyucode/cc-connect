@@ -327,7 +327,7 @@ func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, age
 		w.starter = starter
 	}
 	if w.style == progressStyleCompact && toolBlockProgressEnabled(p) {
-		w.toolBlocks = newToolBlockProgress(lang)
+		w.toolBlocks = newToolBlockProgress(lang, compactProgressMaxChars)
 	}
 	if w.style == progressStyleCard {
 		if progressCardPayloadForTarget(p, replyCtx) {
@@ -445,6 +445,9 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		}
 	default:
 		if w.toolBlocks != nil {
+			if item.Kind != ProgressEntryToolResult && w.toolBlocks.startSegment() {
+				w.handle = nil
+			}
 			w.content = w.toolBlocks.append(item, fallback)
 		} else if w.content == "" {
 			w.content = fallback
