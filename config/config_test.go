@@ -429,6 +429,21 @@ func TestEffectiveDisplay_ProjectOverride(t *testing.T) {
 	}
 }
 
+func TestEffectiveProgressMaxLen(t *testing.T) {
+	global, project := 1900, 2500
+	if got := EffectiveProgressMaxLen(&Config{}, &ProjectConfig{}); got != 0 {
+		t.Fatalf("default = %d, want 0 (built-in default)", got)
+	}
+	cfg := Config{Display: DisplayConfig{ProgressMaxLen: &global}}
+	if got := EffectiveProgressMaxLen(&cfg, &ProjectConfig{}); got != 1900 {
+		t.Fatalf("global = %d, want 1900", got)
+	}
+	proj := ProjectConfig{Display: &DisplayConfig{ProgressMaxLen: &project}}
+	if got := EffectiveProgressMaxLen(&cfg, &proj); got != 2500 {
+		t.Fatalf("project override = %d, want 2500", got)
+	}
+}
+
 func TestEffectiveHistoryMaxLen(t *testing.T) {
 	globalLen, projectLen, unlimited := 800, 1200, 0
 
@@ -545,6 +560,11 @@ func TestValidateProjectDisplayConfig(t *testing.T) {
 			name:    "invalid project history max len",
 			display: &DisplayConfig{HistoryMaxLen: &negativeHistoryMaxLen},
 			wantErr: `projects[0].display.history_max_len must be >= 0`,
+		},
+		{
+			name:    "invalid project progress max len",
+			display: &DisplayConfig{ProgressMaxLen: &negativeHistoryMaxLen},
+			wantErr: `projects[0].display.progress_max_len must be >= 0`,
 		},
 	}
 

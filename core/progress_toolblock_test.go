@@ -241,3 +241,48 @@ func TestUnsolicitedReader_NoToolProgressWithoutToolBlocks(t *testing.T) {
 		t.Fatalf("sent = %#v, want only the final text", sent)
 	}
 }
+
+func TestCompactProgressWriter_SetMaxChars(t *testing.T) {
+	w := &compactProgressWriter{toolBlocks: newToolBlockProgress(LangEnglish, compactProgressMaxChars)}
+	w.setMaxChars(0)
+	if w.maxRunes() != compactProgressMaxChars || w.toolBlocks.maxRunes != compactProgressMaxChars {
+		t.Fatalf("0 must keep the default, got %d/%d", w.maxRunes(), w.toolBlocks.maxRunes)
+	}
+	w.setMaxChars(1900)
+	if w.maxRunes() != 1900 || w.toolBlocks.maxRunes != 1900 {
+		t.Fatalf("limit = %d/%d, want 1900", w.maxRunes(), w.toolBlocks.maxRunes)
+	}
+}
+
+func TestProcessInteractiveEvents_ProgressMaxLenLimitsToolBlocks(t *testing.T) {
+	p := &stubToolBlockPlatform{stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}, style: "compact"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{ToolMaxLen: 300, ToolMessages: true, Mode: "full", ProgressMaxLen: 400})
+
+	sessionKey := "telegram:user-progress-max"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-progress-max")
+	state := &interactiveState{agentSession: agentSession, platform: p, replyCtx: "ctx-progress-max"}
+	e.interactiveStates[sessionKey] = state
+
+	go func() { // more events than the session channel buffers
+		for i := 0; i < 6; i++ {
+			agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: strings.Repeat("c", 100)}
+			agentSession.events <- Event{Type: EventToolResult, ToolResult: "ok", ToolSuccess: boolPtr(true)}
+		}
+		agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+	}()
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-progress-max", time.Now(), nil, nil, state.replyCtx, 0)
+
+	edits := p.getPreviewEdits()
+	if len(edits) == 0 {
+		t.Fatal("no progress edits")
+	}
+	last := edits[len(edits)-1]
+	if n := utf8.RuneCountInString(last); n > 400 {
+		t.Fatalf("progress message has %d runes, want <= 400:\n%s", n, last)
+	}
+	if !strings.HasPrefix(last, "… (") || !strings.Contains(last, "```#6·Bash") {
+		t.Fatalf("want older blocks omitted and #6 kept:\n%s", last)
+	}
+}

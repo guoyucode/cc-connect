@@ -338,6 +338,7 @@ type DisplayCfg struct {
 	ToolMessages     bool
 	HistoryMaxLen    *int // max runes for /history entries; nil = default, 0 = no truncation
 	HideAgentFooter  bool // strip model/token footer lines emitted as agent text
+	ProgressMaxLen   int  // max runes of one in-place progress message; 0 = default
 }
 
 // InstantReplyCfg controls the immediate confirmation reply sent when a message
@@ -5221,6 +5222,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				if e.display.ToolMessages && toolBlockProgressEnabled(p) {
 					if cp == nil {
 						cp = newCompactProgressWriter(e.ctx, p, replyCtx, e.agent.Name(), e.i18n.CurrentLang(), nil)
+						cp.setMaxChars(e.display.ProgressMaxLen)
 					}
 					toolCount++
 					input, msg := e.toolUseProgress(toolCount, event)
@@ -5481,6 +5483,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	}
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, workspaceRenderer)
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
+	cp.setMaxChars(e.display.ProgressMaxLen)
 	state.mu.Unlock()
 
 	// Send instant confirmation reply if enabled and no streaming card is active.
@@ -6665,6 +6668,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, queuedRenderer)
 				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), queuedRenderer)
+				cp.setMaxChars(e.display.ProgressMaxLen)
 
 				// Reset streaming card state for the next turn
 				streamCard = nil

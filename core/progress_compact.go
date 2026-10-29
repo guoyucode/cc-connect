@@ -231,6 +231,7 @@ type compactProgressWriter struct {
 	lastSent   string
 	maxEntries int
 	toolBlocks *toolBlockProgress // non-nil when the platform merges each tool call into one block
+	maxChars   int                // progress message length limit; 0 = compactProgressMaxChars
 
 	// Throttle message edits to avoid platform rate limits (e.g. Discord ~5 edits/5s).
 	minUpdateInterval time.Duration
@@ -367,6 +368,25 @@ func normalizeProgressAgentLabel(name string) string {
 	}
 }
 
+// setMaxChars overrides the progress message length limit (display
+// progress_max_len); n <= 0 keeps the default.
+func (w *compactProgressWriter) setMaxChars(n int) {
+	if n <= 0 {
+		return
+	}
+	w.maxChars = n
+	if w.toolBlocks != nil {
+		w.toolBlocks.maxRunes = n
+	}
+}
+
+func (w *compactProgressWriter) maxRunes() int {
+	if w.maxChars > 0 {
+		return w.maxChars
+	}
+	return compactProgressMaxChars
+}
+
 // Append appends one progress item and updates the in-place message.
 // Returns true when compact rendering handled this item; false means caller
 // should fallback to legacy per-event send.
@@ -441,7 +461,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 			}
 		} else {
 			w.content = renderCardProgressMarkdownFallback(w.entries, truncated)
-			w.content = trimCompactProgressText(w.content, compactProgressMaxChars)
+			w.content = trimCompactProgressText(w.content, w.maxRunes())
 		}
 	default:
 		if w.toolBlocks != nil {
@@ -454,7 +474,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		} else {
 			w.content += "\n\n" + fallback
 		}
-		w.content = trimCompactProgressText(w.content, compactProgressMaxChars)
+		w.content = trimCompactProgressText(w.content, w.maxRunes())
 	}
 
 	if w.content == w.lastSent {

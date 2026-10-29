@@ -200,6 +200,7 @@ type DisplayConfig struct {
 	ToolMaxLen           *int    `toml:"tool_max_len"`           // max chars for tool use messages; 0 = no truncation; default 500
 	ToolMessages         *bool   `toml:"tool_messages"`          // whether tool progress messages are shown; default true
 	HistoryMaxLen        *int    `toml:"history_max_len"`        // max chars per /history entry; 0 = no truncation; default 1000
+	ProgressMaxLen       *int    `toml:"progress_max_len"`       // max chars of one in-place progress message; 0 = default (3800)
 	ShowContextIndicator *bool   `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
 	ReplyFooter          *bool   `toml:"reply_footer"`           // whether Codex-like footer is shown; default true
 	HideAgentFooter      *bool   `toml:"hide_agent_footer"`      // strip agent-emitted model/token footer lines; default false
@@ -1007,6 +1008,18 @@ func EffectiveHistoryMaxLen(cfg *Config, proj *ProjectConfig) int {
 	return 1000
 }
 
+// EffectiveProgressMaxLen returns the max length of one in-place progress
+// message: per-project > global; 0 means the built-in default.
+func EffectiveProgressMaxLen(cfg *Config, proj *ProjectConfig) int {
+	if proj != nil && proj.Display != nil && proj.Display.ProgressMaxLen != nil {
+		return *proj.Display.ProgressMaxLen
+	}
+	if cfg != nil && cfg.Display.ProgressMaxLen != nil {
+		return *cfg.Display.ProgressMaxLen
+	}
+	return 0
+}
+
 // EffectiveShell returns the shell binary, flag, and init command for the project.
 // Resolution: per-project > global > platform default.
 // The flag is auto-detected: "/C" for cmd, "-Command" for powershell/pwsh, "-c" for everything else.
@@ -1160,6 +1173,9 @@ func validateDisplayConfig(prefix string, display *DisplayConfig) error {
 	}
 	if display.HistoryMaxLen != nil && *display.HistoryMaxLen < 0 {
 		return fmt.Errorf("config: %s.history_max_len must be >= 0", prefix)
+	}
+	if display.ProgressMaxLen != nil && *display.ProgressMaxLen < 0 {
+		return fmt.Errorf("config: %s.progress_max_len must be >= 0", prefix)
 	}
 	return nil
 }
