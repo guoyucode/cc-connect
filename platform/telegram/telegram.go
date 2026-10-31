@@ -1440,6 +1440,10 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 	return nil
 }
 
+// KeepPreviewOnFinish finalizes a streaming preview by editing it in place.
+// Deleting it and sending a new message makes the reply visibly flash.
+func (p *Platform) KeepPreviewOnFinish() bool { return true }
+
 // DeletePreviewMessage deletes a stale preview message so the caller can send a fresh one.
 func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) error {
 	h, ok := previewHandle.(*telegramPreviewHandle)

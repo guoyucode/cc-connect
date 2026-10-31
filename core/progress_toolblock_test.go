@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"strconv"
 	"strings"
 	"testing"
@@ -359,5 +360,49 @@ func TestUnsolicitedReader_FlushHonorsNoReply(t *testing.T) {
 			t.Errorf("flush of %q sent %#v, want nothing", text, sent)
 		}
 		_ = e.Stop()
+	}
+}
+
+type keepPreviewPlatform struct {
+	stubCompactProgressPlatform
+	deletes int
+}
+
+func (p *keepPreviewPlatform) DeletePreviewMessage(context.Context, any) error {
+	p.deletes++
+	return nil
+}
+func (p *keepPreviewPlatform) KeepPreviewOnFinish() bool { return true }
+
+func TestProcessInteractiveEvents_KeptPreviewGetsFooterInPlace(t *testing.T) {
+	p := &keepPreviewPlatform{stubCompactProgressPlatform: stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}, style: "compact"}}
+	agent := &stubReplyFooterAgent{stubModelModeAgent: stubModelModeAgent{model: "glm-5.1"}, workDir: t.TempDir()}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetReplyFooterEnabled(true)
+	e.SetDisplayConfig(DisplayCfg{ToolMaxLen: 300, ToolMessages: true, Mode: "full"})
+
+	sessionKey := "telegram:user-keep-preview"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-keep-preview")
+	state := &interactiveState{agentSession: agentSession, platform: p, replyCtx: "ctx", agent: agent}
+	e.interactiveStates[sessionKey] = state
+
+	text := strings.Repeat("reply text ", 10)
+	go func() {
+		agentSession.events <- Event{Type: EventText, Content: text}
+		time.Sleep(200 * time.Millisecond) // let the preview start
+		agentSession.events <- Event{Type: EventResult, Content: text, Done: true}
+	}()
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m", time.Now(), nil, nil, state.replyCtx, 0)
+
+	if len(p.getPreviewStarts()) != 1 {
+		t.Fatalf("preview starts = %#v, want 1", p.getPreviewStarts())
+	}
+	if p.deletes != 0 || len(p.getSent()) != 0 {
+		t.Fatalf("deletes = %d, sent = %#v; want the preview kept and nothing re-sent", p.deletes, p.getSent())
+	}
+	edits := p.getPreviewEdits()
+	if len(edits) == 0 || !strings.Contains(edits[len(edits)-1], "glm-5.1") {
+		t.Fatalf("edits = %#v, want the final edit to carry the footer", edits)
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"path"
 	"strings"
 	"testing"
+
+	"github.com/chenhg5/cc-connect/core"
 )
 
 // richTestServer records Bot API calls and answers them via respond, keyed by
@@ -216,5 +218,15 @@ func TestToolBlockProgressFollowsRich(t *testing.T) {
 	p.richMessages = false
 	if p.ToolBlockProgress() {
 		t.Fatal("ToolBlockProgress = true on the HTML path")
+	}
+}
+
+// A finished reply must replace its streaming preview in place: with the
+// default delete-and-resend the message visibly flashes.
+func TestFinishedPreviewIsEditedInPlace(t *testing.T) {
+	var _ core.PreviewFinishPreference = (*Platform)(nil)
+	var _ core.PreviewCleaner = (*Platform)(nil)
+	if !(&Platform{}).KeepPreviewOnFinish() {
+		t.Fatal("KeepPreviewOnFinish = false")
 	}
 }
