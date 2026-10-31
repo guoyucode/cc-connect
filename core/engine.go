@@ -5116,14 +5116,16 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 		p := state.platform
 		replyCtx := state.replyCtx
 		state.mu.Unlock()
-		if p != nil {
+		// A partial turn may have been cut off while still spelling NO_REPLY.
+		deliverable, isSilent := resolveSilentReply(partial)
+		if p != nil && !isSilent && !couldBeSilentPrefix(partial) {
 			// Send off the reader goroutine and signal flushDone when finished.
 			// stopUnsolicitedReader waits for flushDone within its bounded
 			// timeout, which keeps the flushed text ahead of the next
 			// foreground turn's reply in the common case while a slow
 			// platform call can never extend that wait (some callers hold
 			// interactiveMu) beyond the bound.
-			chunks := SplitMessageCodeFenceAware(partial, maxPlatformMessageLen)
+			chunks := SplitMessageCodeFenceAware(deliverable, maxPlatformMessageLen)
 			flushHandedOff = true
 			go func() {
 				defer close(flushDone)
@@ -5249,7 +5251,10 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					fullResponse = strings.Join(textParts, "")
 				}
 
-				if fullResponse != "" {
+				// History below keeps the original text so the agent retains
+				// its decision to stay silent; only the outbound text changes.
+				deliverable, isSilent := resolveSilentReply(fullResponse)
+				if deliverable != "" && !isSilent {
 					state.mu.Lock()
 					replyAgent := state.agent
 					state.mu.Unlock()
@@ -5258,7 +5263,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					}
 					footerContext := replyFooterContextText(replyFooterSessionContextUsage(agentSession), e.i18n)
 					statusFooter, _ := e.turnStatusFooter(replyAgent, agentSession, workspaceDir, footerContext)
-					sendChunksWithStatusFooter(e.ctx, p, replyCtx, fullResponse, statusFooter, func(p Platform, replyCtx any, chunk string) error {
+					sendChunksWithStatusFooter(e.ctx, p, replyCtx, deliverable, statusFooter, func(p Platform, replyCtx any, chunk string) error {
 						e.send(p, replyCtx, chunk)
 						return nil
 					})
@@ -5310,7 +5315,8 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 
 				slog.Info("unsolicited turn complete",
 					"session", sessionKey,
-					"response_len", len(fullResponse))
+					"response_len", len(fullResponse),
+					"silent", isSilent)
 
 			case EventUserInputRequest:
 				e.showAsyncUserInput(state, p, replyCtx, event)
@@ -6298,16 +6304,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			session.AddHistory("assistant", baseResponse)
 			sessions.Save()
 
-			isSilent := isSilentReply(baseResponse)
-			if !isSilent {
-				if stripped, ok := stripTrailingSilent(baseResponse); ok {
-					if strings.TrimSpace(stripped) == "" {
-						isSilent = true
-					} else {
-						baseResponse = stripped
-						cleanResponse = stripped
-					}
-				}
+			deliverable, isSilent := resolveSilentReply(baseResponse)
+			if !isSilent && deliverable != baseResponse {
+				baseResponse = deliverable
+				cleanResponse = deliverable
 			}
 
 			if !isSilent {
@@ -6807,18 +6807,13 @@ channelClosed:
 		sessions.Save()
 
 		// Respect NO_REPLY even on abnormal exit so silent turns stay silent.
-		if isSilentReply(fullResponse) {
+		deliverable, isSilent := resolveSilentReply(fullResponse)
+		if isSilent {
 			sp.discard()
 			slog.Info("silent reply suppressed (channel closed)", "session", session.ID)
 			return
 		}
-		if stripped, ok := stripTrailingSilent(fullResponse); ok {
-			if strings.TrimSpace(stripped) == "" {
-				sp.discard()
-				return
-			}
-			fullResponse = stripped
-		}
+		fullResponse = deliverable
 
 		e.hooks.Emit(HookEvent{
 			Event:      HookEventMessageSent,
@@ -17853,6 +17848,23 @@ func stripTrailingSilent(text string) (string, bool) {
 		return text, false
 	}
 	return strings.TrimRight(stripped, " \t\r\n"), true
+}
+
+// resolveSilentReply applies the NO_REPLY convention to an agent reply. It
+// returns the text to deliver, with any trailing marker removed, and whether
+// the reply is silent and nothing should be delivered.
+func resolveSilentReply(text string) (deliverable string, silent bool) {
+	if isSilentReply(text) {
+		return "", true
+	}
+	stripped, ok := stripTrailingSilent(text)
+	if !ok {
+		return text, false
+	}
+	if strings.TrimSpace(stripped) == "" {
+		return "", true
+	}
+	return stripped, false
 }
 
 // couldBeSilentPrefix reports whether the trimmed text is still a case-insensitive

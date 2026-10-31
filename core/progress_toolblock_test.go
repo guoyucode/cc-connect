@@ -286,3 +286,78 @@ func TestProcessInteractiveEvents_ProgressMaxLenLimitsToolBlocks(t *testing.T) {
 		t.Fatalf("want older blocks omitted and #6 kept:\n%s", last)
 	}
 }
+
+func TestResolveSilentReply(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+		silent   bool
+	}{
+		{"NO_REPLY", "", true},
+		{" no_reply \n", "", true},
+		{"**NO_REPLY", "", true},
+		{"Nothing new.\nNO_REPLY", "Nothing new.", false},
+		{"All done.", "All done.", false},
+	} {
+		got, silent := resolveSilentReply(tc.in)
+		if got != tc.want || silent != tc.silent {
+			t.Errorf("resolveSilentReply(%q) = %q, %v; want %q, %v", tc.in, got, silent, tc.want, tc.silent)
+		}
+	}
+}
+
+func TestUnsolicitedReader_HonorsNoReply(t *testing.T) {
+	agent := &stubReplyFooterAgent{stubModelModeAgent: stubModelModeAgent{model: "glm-5.1"}, workDir: t.TempDir()}
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-no-reply")
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	defer func() { _ = e.Stop() }()
+	e.SetReplyFooterEnabled(true)
+
+	iKey := "test:ch1:u1"
+	session := e.sessions.GetOrCreateActive(iKey)
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx", agent: agent}
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = state
+	e.interactiveMu.Unlock()
+
+	e.startUnsolicitedReader(state, session, e.sessions, iKey, "")
+	defer e.stopUnsolicitedReader(state)
+
+	// A bare marker sends nothing, not even a footer, but stays in history.
+	sess.events <- Event{Type: EventResult, Content: "NO_REPLY", Done: true}
+	// A trailing marker is stripped from the delivered text.
+	sess.events <- Event{Type: EventResult, Content: "Still waiting.\nNO_REPLY", Done: true}
+
+	sent := waitForPlatformSend(p, 1, 5*time.Second)
+	if len(sent) != 1 || !strings.HasPrefix(sent[0], "Still waiting.") || strings.Contains(sent[0], "NO_REPLY") {
+		t.Fatalf("sent = %#v, want only the stripped second reply", sent)
+	}
+	history := session.GetHistory(0)
+	if len(history) == 0 || history[0].Content != "NO_REPLY" {
+		t.Fatalf("history = %#v, want the original NO_REPLY recorded", history)
+	}
+}
+
+func TestUnsolicitedReader_FlushHonorsNoReply(t *testing.T) {
+	for _, text := range []string{"NO_REPLY", "NO_RE"} {
+		p := &stubPlatformEngine{n: "test"}
+		sess := newControllableSession("unsol-flush-no-reply")
+		e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+		session := e.sessions.GetOrCreateActive("test:ch1:u1")
+		state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx"}
+
+		e.startUnsolicitedReader(state, session, e.sessions, "test:ch1:u1", "")
+		sess.events <- Event{Type: EventText, Content: text}
+		deadline := time.Now().Add(2 * time.Second)
+		for len(sess.events) > 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+		e.stopUnsolicitedReader(state)
+
+		if sent := p.getSent(); len(sent) != 0 {
+			t.Errorf("flush of %q sent %#v, want nothing", text, sent)
+		}
+		_ = e.Stop()
+	}
+}
